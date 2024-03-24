@@ -304,43 +304,62 @@ impl Alphabet for Pem {
 }
 */
 
+struct Decoder {
+    table: &'static [Code; 256],
+    quad: Quad,
+    state: State,
+}
+
+impl Decoder {
+    fn new(alphabet: impl Alphabet) -> Self {
+        Self {
+            table: alphabet.decode_table(),
+            quad: Quad::new(),
+            state: State::Data,
+        }
+    }
+
+    fn process(&mut self, input: &[u8], output: &mut [u8], last: bool) -> Result<usize, Error> {
+        let mut offs = 0;
+        for (i, inp) in input.iter().enumerate() {
+            match (self.state, self.table[*inp as usize]) {
+                (_, SKIP) => continue,
+                (State::Data, PAD) => {
+                    self.state = State::Pad1;
+                }
+                (State::Pad1, PAD) => {
+                    self.state = State::Pad2;
+                }
+                (State::Data, Code(v)) => self.quad.add(v),
+                (_, INVALID) | (State::Pad1, _) | (State::Pad2, _) => {
+                    return Err(Error::InvalidInput { at_offset: i })
+                }
+            }
+
+            if self.quad.complete() {
+                offs += self.quad.emit(&mut output[offs..])?;
+            }
+        }
+
+        if last {
+            let pad = match self.state {
+                State::Data => 0,
+                State::Pad1 => 1,
+                State::Pad2 => 2,
+            };
+            offs += self.quad.emit_final(pad, &mut output[offs..])?;
+        }
+
+        Ok(offs)
+    }
+}
+
 pub const fn decode_len_estimate(input_len: usize) -> usize {
     ((input_len + 3) / 4) * 3
 }
 
 pub fn decode(alphabet: impl Alphabet, input: &[u8], output: &mut [u8]) -> Result<usize, Error> {
-    let table = alphabet.decode_table();
-    let mut quad = Quad::new();
-    let mut offs = 0;
-    let mut state = State::Data;
-
-    for (i, inp) in input.iter().enumerate() {
-        match (state, table[*inp as usize]) {
-            (_, SKIP) => continue,
-            (State::Data, PAD) => {
-                state = State::Pad1;
-            }
-            (State::Pad1, PAD) => {
-                state = State::Pad2;
-            }
-            (State::Data, Code(v)) => quad.add(v),
-            (_, INVALID) | (State::Pad1, _) | (State::Pad2, _) => {
-                return Err(Error::InvalidInput { at_offset: i })
-            }
-        };
-
-        if quad.complete() {
-            offs += quad.emit(&mut output[offs..])?;
-        }
-    }
-
-    let pad = match state {
-        State::Data => 0,
-        State::Pad1 => 1,
-        State::Pad2 => 2,
-    };
-    offs += quad.emit_final(pad, &mut output[offs..])?;
-    Ok(offs)
+    Decoder::new(alphabet).process(input, output, true)
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -359,6 +378,7 @@ pub fn decode_into_vec(alphabet: impl Alphabet, input: &[u8]) -> Result<Vec<u8>,
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    OutputDoesNotFit,
     InvalidInput { at_offset: usize },
 }
 
@@ -408,8 +428,14 @@ impl Quad {
     fn emit_pad(&mut self, out: &mut [u8], pad: usize) -> Result<usize, Error> {
         let len = 3 - pad;
         let t = self.to_triple();
-        out[..len].copy_from_slice(&t.as_ref()[..len]);
-        Ok(len)
+
+        match out.get_mut(..len) {
+            Some(chunk) => {
+                chunk.copy_from_slice(&t.as_ref()[..len]);
+                Ok(len)
+            }
+            None => Err(Error::OutputDoesNotFit),
+        }
     }
 
     #[inline]
@@ -500,6 +526,29 @@ mod tests {
         assert_eq!(
             decode_into_vec(Standard, b"aaaa").unwrap(),
             vec![0x69, 0xa6, 0x9a]
+        );
+    }
+
+    #[test]
+    fn in_place() {
+        let mut buf = [0u8; 8];
+        assert_eq!(Ok(0), decode(Standard, b"", &mut buf[..0]));
+        assert_eq!(Ok(1), decode(Standard, b"AA", &mut buf[..1]));
+        assert_eq!(&buf[..1], &[0]);
+        assert_eq!(Ok(2), decode(Standard, b"AAA", &mut buf[..2]));
+        assert_eq!(&buf[..2], &[0, 0]);
+        assert_eq!(Ok(3), decode(Standard, b"AAAA", &mut buf[..3]));
+        assert_eq!(&buf[..3], &[0, 0, 0]);
+        assert_eq!(Ok(8), decode(Standard, b"AAAAAAAAAAA", &mut buf[..]));
+        assert_eq!(&buf[..], &[0; 8]);
+
+        assert_eq!(
+            Err(Error::OutputDoesNotFit),
+            decode(Standard, b"AA", &mut buf[..0])
+        );
+        assert_eq!(
+            Err(Error::OutputDoesNotFit),
+            decode(Standard, b"AAAAAAA", &mut buf[..4])
         );
     }
 }
